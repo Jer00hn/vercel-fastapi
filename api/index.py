@@ -14,8 +14,8 @@ app = FastAPI(
     description="Асинхронный сервис проверки подписок (Hash/HSET)"
 )
 
-UPSTASH_URL = os.getenv("UPSTASH_URL")
-UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN")
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY")
 
 SUBS_KEY = "subscriptions"
