@@ -1,0 +1,10 @@
+[project]
+name = "subscription-api"
+version = "0.1.0"
+description = "FastAPI Subscription Checker"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "httpx",
+]
