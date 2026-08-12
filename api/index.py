@@ -104,7 +104,7 @@ async def call_upstash(*args):
 
 @app.middleware("http")
 async def admin_guard(request, call_next):
-    if request.url.path.startswith("/admin"):
+    if request.url.path.startswith("/api/admin"):
         key = request.headers.get("X-Admin-Key")
         if key != ADMIN_SECRET_KEY:
             logger.warning("⚠️ Несанкционированный доступ к /admin")
