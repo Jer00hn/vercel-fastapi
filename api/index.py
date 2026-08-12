@@ -1,115 +1,164 @@
 import os
-import time
 import logging
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Header
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 
-logging.basicConfig(level=logging.INFO)
+
+# ============================================================
+# ЛОГИРОВАНИЕ
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger("subscription_server")
+
+
+# ============================================================
+# FASTAPI APP
+# ============================================================
 
 app = FastAPI(
     title="Subscription Management API",
-    description="Асинхронный сервис проверки подписок (Hash/HSET)"
+    description="Защищенный сервис проверки и управления подписками"
 )
+
+
+# ============================================================
+# ENV
+# ============================================================
 
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY")
 
-SUBS_KEY = "subscriptions"
+USER_KEY = "user:"
+EXPIRY_INDEX = "expiry_index"
 
+
+# ============================================================
+# Pydantic модель
+# ============================================================
 
 class SubscriptionRequest(BaseModel):
     username: str
     days: int
 
 
-async def call_upstash(*args):
+# ============================================================
+# Создание httpx клиента один раз
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
     if not UPSTASH_URL or not UPSTASH_TOKEN:
-        logger.error("❌ Не заданы переменные UPSTASH_URL или UPSTASH_TOKEN!")
-        raise HTTPException(status_code=500, detail="Server configuration error")
+        logger.error("❌ UPSTASH_URL / UPSTASH_TOKEN не заданы!")
+        raise RuntimeError("Missing Upstash configuration")
+
+    app.state.http_client = httpx.AsyncClient(timeout=5)
+    logger.info("HTTP client создан")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await app.state.http_client.aclose()
+    logger.info("HTTP client закрыт")
+
+
+# ============================================================
+# Upstash helper
+# ============================================================
+
+async def call_upstash(*args):
+    """
+    Отправляет команду в Upstash Redis через REST API.
+    Использует один общий httpx.AsyncClient.
+    """
+    client: httpx.AsyncClient = app.state.http_client
 
     headers = {
         "Authorization": f"Bearer {UPSTASH_TOKEN}",
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                UPSTASH_URL, 
-                json=list(args), 
-                headers=headers, 
-                timeout=5.0
-            )
-            response.raise_for_status()
-            return response.json().get("result")
-        except httpx.HTTPError as e:
-            logger.error(f"❌ Ошибка обращения к Upstash Redis: {e}")
-            raise HTTPException(status_code=502, detail="Database connection error")
+    try:
+        resp = await client.post(
+            UPSTASH_URL,
+            json=list(args),
+            headers=headers
+        )
+        resp.raise_for_status()
+        return resp.json().get("result")
+    except httpx.RequestError as e:
+        logger.error(f"❌ Ошибка Upstash: {e}")
+        raise HTTPException(502, "Database connection error")
 
 
-# =====================================================================
-# 1. ПУБЛИЧНЫЙ ЭНДПОИНТ
-# =====================================================================
+# ============================================================
+# Middleware для админки
+# ============================================================
+
+@app.middleware("http")
+async def admin_guard(request, call_next):
+    if request.url.path.startswith("/admin"):
+        key = request.headers.get("X-Admin-Key")
+        if key != ADMIN_SECRET_KEY:
+            logger.warning("⚠️ Несанкционированный доступ к /admin")
+            raise HTTPException(401, "Unauthorized")
+    return await call_next(request)
+
+
+# ============================================================
+# PUBLIC: check subscription
+# ============================================================
 
 @app.get("/check/{username}")
 async def check_subscription(username: str):
-    logger.info(f"Запрос проверки подписки для: {username}")
-    
-    # Заменяем ZSCORE на HGET
-    score = await call_upstash("HGET", SUBS_KEY, username)
+    logger.info(f"Проверка подписки: {username}")
 
-    if score is None:
-        logger.info(f"Пользователь '{username}' не найден в хэше.")
+    expiry_ts = await call_upstash("HGET", f"{USER_KEY}{username}", "expiry")
+
+    if expiry_ts is None:
         return {"active": False, "expiry": None}
 
-    expiry_timestamp = float(score)
-
-    if time.time() >= expiry_timestamp:
-        logger.info(f"Подписка для '{username}' истекла.")
+    try:
+        expiry_ts = float(expiry_ts)
+    except ValueError:
+        logger.error(f"⚠️ Некорректный expiry у {username}")
         return {"active": False, "expiry": None}
 
-    expiry_dt = datetime.fromtimestamp(expiry_timestamp)
+    now = datetime.utcnow().timestamp()
+
+    if now >= expiry_ts:
+        return {"active": False, "expiry": None}
+
+    expiry_dt = datetime.utcfromtimestamp(expiry_ts)
     expiry_str = expiry_dt.strftime("%Y-%m-%d %H:%M:%S")
-    
-    logger.info(f"У пользователя '{username}' активна подписка до {expiry_str}")
-    return {
-        "active": True,
-        "expiry": expiry_str
-    }
+
+    return {"active": True, "expiry": expiry_str}
 
 
-# =====================================================================
-# 2. АДМИНСКИЕ ЭНДПОИНТЫ
-# =====================================================================
-
-def verify_admin(x_admin_key: str):
-    if not ADMIN_SECRET_KEY or x_admin_key != ADMIN_SECRET_KEY:
-        logger.warning("⚠️ Несанкционированная попытка доступа к админ-панели!")
-        raise HTTPException(
-            status_code=401, 
-            detail="Unauthorized: Incorrect or missing X-Admin-Key header"
-        )
-
+# ============================================================
+# ADMIN: add subscription
+# ============================================================
 
 @app.post("/admin/add")
-async def add_subscription(
-    req: SubscriptionRequest, 
-    x_admin_key: str = Header(None)
-):
-    verify_admin(x_admin_key)
+async def add_subscription(req: SubscriptionRequest):
+    expiry_dt = datetime.utcnow() + timedelta(days=req.days)
+    expiry_ts = int(expiry_dt.timestamp())
 
-    expiry_dt = datetime.now() + timedelta(days=req.days)
-    expiry_timestamp = int(expiry_dt.timestamp())
+    # Основная запись
+    await call_upstash("HSET", f"{USER_KEY}{req.username}", "expiry", expiry_ts)
 
-    # HSET key field value -> HSET subscriptions username timestamp
-    await call_upstash("HSET", SUBS_KEY, req.username, expiry_timestamp)
+    # Индекс по времени
+    await call_upstash("ZADD", EXPIRY_INDEX, expiry_ts, req.username)
 
     expiry_str = expiry_dt.strftime("%Y-%m-%d %H:%M:%S")
-    logger.info(f"✅ Выдана подписка для '{req.username}' на {req.days} дн. (до {expiry_str})")
+    logger.info(f"✅ Выдана подписка {req.username} до {expiry_str}")
 
     return {
         "status": "success",
@@ -119,16 +168,17 @@ async def add_subscription(
     }
 
 
+# ============================================================
+# ADMIN: remove subscription
+# ============================================================
+
 @app.delete("/admin/remove/{username}")
-async def remove_subscription(username: str, x_admin_key: str = Header(None)):
-    verify_admin(x_admin_key)
+async def remove_subscription(username: str):
+    await call_upstash("DEL", f"{USER_KEY}{username}")
+    removed = await call_upstash("ZREM", EXPIRY_INDEX, username)
 
-    # Заменяем ZREM на HDEL
-    removed_count = await call_upstash("HDEL", SUBS_KEY, username)
-
-    if removed_count:
-        logger.info(f"❌ Подписка пользователя '{username}' была удалена.")
-        return {"status": "success", "message": f"Пользователь '{username}' удален."}
-    
-    return {"status": "not_found", "message": f"Пользователь '{username}' не найден в базе."}
-    
+    if removed:
+        logger.info(f"❌ Подписка {username} удалена")
+        return {"status": "success", "message": f"{username} удалён"}
+    else:
+        return {"status": "not_found", "message": f"{username} не найден"}
