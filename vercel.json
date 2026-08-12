@@ -17,7 +17,7 @@
   "routes": [
     { "src": "/api/(.*)", "dest": "/api/index.py" },
     { "src": "/check/(.*)", "dest": "/api/index.py" },
-    { "src": "/admin/(add|remove/.*)", "method": "POST", "dest": "/api/index.py" },
-    { "src": "/admin/(remove/.*)", "method": "DELETE", "dest": "/api/index.py" }
+    { "src": "/admin/(add|remove/.*)", "methods": ["POST"], "dest": "/api/index.py" },
+    { "src": "/admin/(remove/.*)", "methods": ["DELETE"], "dest": "/api/index.py" }
   ]
 }
